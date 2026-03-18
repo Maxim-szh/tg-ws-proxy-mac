@@ -1,6 +1,9 @@
 # TG WS Proxy для macOS
 
 [![Release](https://img.shields.io/github/v/release/Maxim-szh/tg-ws-proxy-mac)](https://github.com/Maxim-szh/tg-ws-proxy-mac/releases)
+[![Downloads](https://img.shields.io/github/downloads/Maxim-szh/tg-ws-proxy-mac/total)](https://github.com/Maxim-szh/tg-ws-proxy-mac/releases)
+[![Issues](https://img.shields.io/github/issues/Maxim-szh/tg-ws-proxy-mac)](https://github.com/Maxim-szh/tg-ws-proxy-mac/issues)
+[![License](https://img.shields.io/github/license/Maxim-szh/tg-ws-proxy-mac)](LICENSE)
 
 Локальный SOCKS5-прокси для Telegram Desktop, который ускоряет загрузку файлов через WebSocket.
 
@@ -30,6 +33,7 @@ cd tg-ws-proxy-mac
 pip install -r requirements-mac.txt
 python app/macos.py
 ```
+
 🚀 Использование
 Запустите TG WS Proxy (иконка появится в меню-баре)
 
@@ -59,15 +63,26 @@ python app/macos.py
 🚪 Выйти из приложения
 
 📋 Логи
-bash
 ~/Library/Application Support/TgWsProxy/proxy.log
 🛠 Сборка из исходников
 ``` bash
 cd installer
 ./build_app.sh
 ```
+
 📄 Лицензия
 MIT License
 
-⭐ Поддержка
-Если проект помог, поставьте звезду на GitHub!
+🤝 Обратная связь и поддержка
+Если у вас возникли проблемы или есть предложения:
+
+🐛 Сообщить об ошибке – создайте Bug Report
+
+💡 Предложить идею – создайте Feature Request
+
+❓ Задать вопрос – создайте Question
+
+Или просто откройте новый Issue
+
+⭐ Поддержка проекта
+Если проект оказался полезным, поставьте звезду на GitHub – это помогает развитию!
