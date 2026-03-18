@@ -1,0 +1,8 @@
+#!/bin/sh
+'''exec' "/Users/maksim/Desktop/Всякое/Код/python/TG WS Proxy v1.1.1 macos/installer/dist/TG WS Proxy.app/Contents/Resources/venv/bin/python3.11" "$0" "$@"
+' '''
+import sys
+from pip._internal.cli.main import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())
