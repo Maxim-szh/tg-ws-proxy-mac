@@ -1,7 +1,6 @@
 # TG WS Proxy для macOS
 
 [![Release](https://img.shields.io/github/v/release/Maxim-szh/tg-ws-proxy-mac)](https://github.com/Maxim-szh/tg-ws-proxy-mac/releases)
-[![Downloads](https://img.shields.io/github/downloads/Maxim-szh/tg-ws-proxy-mac/total)](https://github.com/Maxim-szh/tg-ws-proxy-mac/releases)
 
 Локальный SOCKS5-прокси для Telegram Desktop, который ускоряет загрузку файлов через WebSocket.
 
