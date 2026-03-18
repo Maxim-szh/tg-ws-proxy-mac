@@ -63,9 +63,10 @@ python app/macos.py
 bash
 ~/Library/Application Support/TgWsProxy/proxy.log
 🛠 Сборка из исходников
-bash
+``` bash
 cd installer
 ./build_app.sh
+```
 📄 Лицензия
 MIT License
 
