@@ -35,6 +35,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Optional, List
 import webbrowser
+from logging.handlers import RotatingFileHandler
 
 # Для GUI на macOS используем PyObjC или стандартный tkinter с доработкой
 try:
@@ -69,18 +70,30 @@ LOG_FILE = APP_DIR / "proxy.log"
 FIRST_RUN_MARKER = APP_DIR / ".first_run_done"
 IPV6_WARN_MARKER = APP_DIR / ".ipv6_warned"
 
+# Обновленный DEFAULT_CONFIG с набором DC (2,4)
 DEFAULT_CONFIG = {
     "port": 1080,
     "host": "127.0.0.1",
-    "dc_ip": ["2:149.154.167.220", "4:149.154.167.220"],
+    "dc_ip": [
+        "2:149.154.167.220",   # DC2 - основной трафик
+        "4:149.154.167.220"    # DC4 - медиа
+    ],
     "verbose": False,
 }
+
+RECOMMENDED_DC_IP = [
+    "1:149.154.175.50",
+    "2:149.154.167.220",
+    "4:149.154.167.220",
+    "5:91.108.56.100",
+]
 
 _proxy_thread: Optional[threading.Thread] = None
 _async_stop: Optional[object] = None
 _config: dict = {}
 _exiting: bool = False
 _lock_file_path: Optional[Path] = None
+_logging_initialized = False
 
 log = logging.getLogger("tg-ws-mac")
 
@@ -165,21 +178,28 @@ def save_config(cfg: dict):
 
 def setup_logging(verbose: bool = False):
     """Настройка логирования для macOS"""
+    global _logging_initialized
     _ensure_dirs()
-    
-    # Очистка формата от дат, так как логирование будет в файл
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
-    
-    # Файловый обработчик
-    fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+
+    # Prevent duplicate handlers on restart/reconfigure.
+    if _logging_initialized:
+        for handler in root.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        return
+
+    fh = RotatingFileHandler(
+        str(LOG_FILE), maxBytes=3 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s  %(levelname)-5s  %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"))
     root.addHandler(fh)
-    
-    # Консольный вывод только если не в .app бандле
+
     if not getattr(sys, 'frozen', False):
         ch = logging.StreamHandler(sys.stdout)
         ch.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -187,6 +207,8 @@ def setup_logging(verbose: bool = False):
             "%(asctime)s  %(levelname)-5s  %(message)s",
             datefmt="%H:%M:%S"))
         root.addHandler(ch)
+
+    _logging_initialized = True
 
 
 def start_proxy():
@@ -217,7 +239,7 @@ def start_proxy():
     _proxy_thread.start()
 
 
-def _run_proxy_thread(port: int, dc_opt: Dict[int, str], verbose: bool,
+def _run_proxy_thread(port: int, dc_opt: Dict[int, List[str]], verbose: bool,
                       host: str = '127.0.0.1'):
     """Запуск прокси в asyncio"""
     global _async_stop
@@ -251,7 +273,9 @@ def stop_proxy():
         loop, stop_ev = _async_stop
         loop.call_soon_threadsafe(stop_ev.set)
         if _proxy_thread:
-            _proxy_thread.join(timeout=2)
+            _proxy_thread.join(timeout=5)
+            if _proxy_thread.is_alive():
+                log.warning("Proxy thread is still alive after stop timeout")
     _proxy_thread = None
     log.info("Proxy stopped")
 
@@ -264,6 +288,10 @@ def restart_proxy():
     start_proxy()
 
 
+def _escape_applescript(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 def _show_error_dialog(text: str, title: str = "TG WS Proxy — Ошибка"):
     """Показ диалога ошибки на macOS"""
     if TK_AVAILABLE:
@@ -272,8 +300,11 @@ def _show_error_dialog(text: str, title: str = "TG WS Proxy — Ошибка"):
         messagebox.showerror(title, text)
         root.destroy()
     else:
-        # Fallback на AppleScript
-        script = f'display dialog "{text}" with title "{title}" buttons {{"OK"}} default button "OK" with icon stop'
+        script = (
+            f'display dialog "{_escape_applescript(text)}" '
+            f'with title "{_escape_applescript(title)}" '
+            f'buttons {{"OK"}} default button "OK" with icon stop'
+        )
         subprocess.run(['osascript', '-e', script], capture_output=True)
 
 
@@ -285,7 +316,11 @@ def _show_info_dialog(text: str, title: str = "TG WS Proxy"):
         messagebox.showinfo(title, text)
         root.destroy()
     else:
-        script = f'display dialog "{text}" with title "{title}" buttons {{"OK"}} default button "OK" with icon note'
+        script = (
+            f'display dialog "{_escape_applescript(text)}" '
+            f'with title "{_escape_applescript(title)}" '
+            f'buttons {{"OK"}} default button "OK" with icon note'
+        )
         subprocess.run(['osascript', '-e', script], capture_output=True)
 
 
@@ -298,9 +333,49 @@ def _show_yesno_dialog(text: str, title: str = "TG WS Proxy") -> bool:
         root.destroy()
         return result
     else:
-        script = f'display dialog "{text}" with title "{title}" buttons {{"Нет", "Да"}} default button "Да"'
+        script = (
+            f'display dialog "{_escape_applescript(text)}" '
+            f'with title "{_escape_applescript(title)}" '
+            f'buttons {{"Нет", "Да"}} default button "Да"'
+        )
         result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
         return "button returned:Да" in result.stdout
+
+
+def _prompt_text_dialog(text: str, default: str = "", title: str = "TG WS Proxy") -> Optional[str]:
+    """Native macOS prompt with text input. Returns None on cancel."""
+    script = (
+        f'display dialog "{_escape_applescript(text)}" '
+        f'with title "{_escape_applescript(title)}" '
+        f'default answer "{_escape_applescript(default)}" '
+        f'buttons {{"Отмена", "OK"}} default button "OK"'
+    )
+    result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    marker = "text returned:"
+    if marker not in out:
+        return None
+    return out.split(marker, 1)[1].strip()
+
+
+def _prompt_yesno_native(text: str, title: str = "TG WS Proxy") -> Optional[bool]:
+    """Native macOS yes/no prompt. Returns None on cancel/error."""
+    script = (
+        f'display dialog "{_escape_applescript(text)}" '
+        f'with title "{_escape_applescript(title)}" '
+        f'buttons {{"Отмена", "Нет", "Да"}} default button "Да"'
+    )
+    result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    if "button returned:Да" in out:
+        return True
+    if "button returned:Нет" in out:
+        return False
+    return None
 
 
 def _has_ipv6_enabled() -> bool:
@@ -332,11 +407,21 @@ class TgWsProxyApp:
         self.status_var = None
         self.stats_text = None
         self.root = None
+        self.log_window = None
+        self.log_text = None
+        self.log_tail_lines = 250
+        self._tray_mode = False
         
         # Настройка базового логирования
         setup_logging(self.config.get("verbose", False))
         
-        # Показываем окно настроек при первом запуске
+        # On macOS Tahoe tkinter may crash in tray context.
+        # Prefer tray startup and avoid first-run tkinter wizard.
+        if RUMP_AVAILABLE:
+            FIRST_RUN_MARKER.touch(exist_ok=True)
+            self.start_in_tray()
+            return
+
         if not FIRST_RUN_MARKER.exists():
             self.show_first_run()
         else:
@@ -345,8 +430,10 @@ class TgWsProxyApp:
     def start_in_tray(self):
         """Запуск в системном трее"""
         if RUMP_AVAILABLE:
+            self._tray_mode = True
             self.run_rumps_app()
         else:
+            self._tray_mode = False
             # Fallback на стандартное окно
             self.show_main_window()
     
@@ -354,17 +441,15 @@ class TgWsProxyApp:
         """Запуск через rumps (macOS native tray)"""
         class TgWsProxyRumps(rumps.App):
             def __init__(self, app_instance):
-                super().__init__("TG WS Proxy", icon=None)
+                super().__init__("TG WS Proxy", icon=None, quit_button="Выход")
                 self.app = app_instance
                 self.menu = [
                     rumps.MenuItem(f"Открыть в Telegram (127.0.0.1:{app_instance.config['port']})", 
                                   callback=self.open_in_telegram),
                     None,  # Separator
                     rumps.MenuItem("Перезапустить прокси", callback=self.restart_proxy),
-                    rumps.MenuItem("Настройки...", callback=self.show_settings),
+                    rumps.MenuItem("Настройки", callback=self.show_settings),
                     rumps.MenuItem("Открыть логи", callback=self.open_logs),
-                    None,
-                    rumps.MenuItem("Выход", callback=self.quit_app)
                 ]
             
             def open_in_telegram(self, sender):
@@ -379,9 +464,6 @@ class TgWsProxyApp:
             def open_logs(self, sender):
                 self.app.open_logs()
             
-            def quit_app(self, sender):
-                self.app.quit_app()
-        
         # Запуск прокси
         start_proxy()
         
@@ -453,8 +535,14 @@ class TgWsProxyApp:
         """Обновление статистики"""
         if self.stats_text and self.stats_text.winfo_exists():
             stats = tg_ws_proxy._stats.summary() if hasattr(tg_ws_proxy, '_stats') else "Статистика недоступна"
+            best_ip = (
+                tg_ws_proxy._best_ip_snapshot()
+                if hasattr(tg_ws_proxy, '_best_ip_snapshot')
+                else "недоступно"
+            )
             self.stats_text.delete(1.0, tk.END)
             self.stats_text.insert(1.0, f"Статистика работы:\n{stats}\n\n")
+            self.stats_text.insert(tk.END, f"Лучшие IP по DC:\n{best_ip}\n\n")
             self.stats_text.insert(tk.END, f"Лог-файл: {LOG_FILE}\n")
             self.root.after(2000, self.update_stats)
     
@@ -523,11 +611,70 @@ class TgWsProxyApp:
             NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         except:
             pass
-        
+
+        # Native simple settings for tray mode (no tkinter on Tahoe).
+        if self._tray_mode:
+            try:
+                current_port = str(self.config.get("port", DEFAULT_CONFIG["port"]))
+                current_dc = ', '.join(self.config.get("dc_ip", DEFAULT_CONFIG["dc_ip"]))
+
+                port_s = _prompt_text_dialog(
+                    "Порт прокси (1..65535):", default=current_port,
+                    title="TG WS Proxy - Настройки"
+                )
+                if port_s is None:
+                    return
+                try:
+                    port = int(port_s.strip())
+                    if not (1 <= port <= 65535):
+                        raise ValueError
+                except ValueError:
+                    _show_error_dialog("Некорректный порт. Допустимо: 1..65535")
+                    return
+
+                dc_raw = _prompt_text_dialog(
+                    "DC маппинги через запятую (формат DC:IP).\n"
+                    "Рекомендуется: 1,2,4,5",
+                    default=current_dc,
+                    title="TG WS Proxy - Настройки"
+                )
+                if dc_raw is None:
+                    return
+                lines = [x.strip() for x in dc_raw.split(',') if x.strip()]
+                if not lines:
+                    lines = list(RECOMMENDED_DC_IP)
+                tg_ws_proxy.parse_dc_ip_list(lines)
+
+                new_config = {
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "dc_ip": lines,
+                    "verbose": bool(self.config.get("verbose", DEFAULT_CONFIG["verbose"])),
+                }
+                save_config(new_config)
+                self.config.update(new_config)
+                subprocess.run([
+                    'osascript', '-e',
+                    'display notification "Настройки сохранены" with title "TG WS Proxy"'
+                ], capture_output=True)
+
+                restart_now = _prompt_yesno_native(
+                    "Перезапустить прокси сейчас?", title="TG WS Proxy - Настройки"
+                )
+                if restart_now:
+                    restart_proxy()
+            except Exception as exc:
+                log.error(f"Native settings dialog failed: {exc}")
+                subprocess.run(['open', str(CONFIG_FILE)])
+            return
+
         if not TK_AVAILABLE:
             return
-        
-        settings_window = tk.Toplevel()
+
+        if self.root and self.root.winfo_exists():
+            settings_window = tk.Toplevel(self.root)
+        else:
+            settings_window = tk.Tk()
         settings_window.title("Настройки TG WS Proxy")
         settings_window.geometry("500x500")
         settings_window.resizable(False, False)
@@ -576,11 +723,15 @@ class TgWsProxyApp:
             # Валидация
             try:
                 host = host_var.get().strip()
+                if not host:
+                    raise ValueError("host")
                 port = int(port_var.get().strip())
                 if not (1 <= port <= 65535):
-                    raise ValueError
+                    raise ValueError("port")
                 
                 lines = [l.strip() for l in dc_text.get("1.0", "end").strip().splitlines() if l.strip()]
+                if not lines:
+                    raise ValueError("dc")
                 tg_ws_proxy.parse_dc_ip_list(lines)
                 
                 # Сохраняем
@@ -599,10 +750,44 @@ class TgWsProxyApp:
                     restart_proxy()
                 
             except ValueError:
-                messagebox.showerror("Ошибка", "Некорректные значения в настройках")
+                messagebox.showerror(
+                    "Ошибка",
+                    "Некорректные значения.\n"
+                    "- Host не должен быть пустым\n"
+                    "- Port: 1..65535\n"
+                    "- DC строки в формате DC:IP"
+                )
+
+        def load_defaults():
+            host_var.set(DEFAULT_CONFIG["host"])
+            port_var.set(str(DEFAULT_CONFIG["port"]))
+            dc_text.delete("1.0", "end")
+            dc_text.insert("1.0", "\n".join(DEFAULT_CONFIG["dc_ip"]))
+            verbose_var.set(DEFAULT_CONFIG["verbose"])
+
+        def test_config():
+            try:
+                host = host_var.get().strip()
+                if not host:
+                    raise ValueError("host")
+                port = int(port_var.get().strip())
+                if not (1 <= port <= 65535):
+                    raise ValueError("port")
+                lines = [l.strip() for l in dc_text.get("1.0", "end").strip().splitlines() if l.strip()]
+                if not lines:
+                    raise ValueError("dc")
+                tg_ws_proxy.parse_dc_ip_list(lines)
+                _show_info_dialog("Проверка прошла успешно. Конфигурация выглядит корректной.")
+            except ValueError:
+                messagebox.showerror("Ошибка", "Проверка не пройдена. Исправьте значения и повторите.")
         
-        ttk.Button(main_frame, text="Сохранить", command=save_settings).grid(row=6, column=0, pady=20)
-        ttk.Button(main_frame, text="Отмена", command=settings_window.destroy).grid(row=6, column=1, pady=20)
+        ttk.Button(main_frame, text="Проверить", command=test_config).grid(row=6, column=0, pady=20, sticky=tk.W)
+        ttk.Button(main_frame, text="По умолчанию", command=load_defaults).grid(row=6, column=0, pady=20)
+        ttk.Button(main_frame, text="Сохранить", command=save_settings).grid(row=6, column=1, pady=20, sticky=tk.W)
+        ttk.Button(main_frame, text="Отмена", command=settings_window.destroy).grid(row=6, column=1, pady=20, sticky=tk.E)
+
+        settings_window.lift()
+        settings_window.focus_force()
     
     def open_in_telegram(self):
         """Открыть прокси в Telegram"""
@@ -616,7 +801,9 @@ class TgWsProxyApp:
             log.error(f"Failed to open URL: {e}")
             # Копируем в буфер обмена на macOS
             try:
-                subprocess.run(['osascript', '-e', f'set the clipboard to "{url}"'])
+                subprocess.run(
+                    ['osascript', '-e', f'set the clipboard to "{_escape_applescript(url)}"']
+                )
                 _show_info_dialog(
                     f"Не удалось открыть Telegram автоматически.\n\n"
                     f"Ссылка скопирована в буфер обмена: {url}")
@@ -629,12 +816,100 @@ class TgWsProxyApp:
         if self.status_var:
             self.status_var.set("Прокси перезапущен")
     
+    def _read_log_tail(self, max_lines: int) -> str:
+        if not LOG_FILE.exists():
+            return "Лог-файл еще не создан.\n"
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return ''.join(lines[-max_lines:])
+        except Exception as exc:
+            return f"Не удалось прочитать лог: {exc}\n"
+
+    def _refresh_log_view(self):
+        if not self.log_window or not self.log_text:
+            return
+        if not self.log_window.winfo_exists() or not self.log_text.winfo_exists():
+            self.log_window = None
+            self.log_text = None
+            return
+        content = self._read_log_tail(self.log_tail_lines)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.insert("1.0", content)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.log_window.after(1200, self._refresh_log_view)
+
     def open_logs(self):
-        """Открыть файл логов в стандартном редакторе macOS"""
-        if LOG_FILE.exists():
-            subprocess.run(['open', str(LOG_FILE)])
+        """Удобный просмотр логов внутри GUI с автообновлением."""
+        if self._tray_mode:
+            try:
+                _ensure_dirs()
+                if not LOG_FILE.exists():
+                    LOG_FILE.touch()
+                subprocess.run(['open', str(LOG_FILE)])
+            except Exception as exc:
+                log.error(f"Failed to open logs: {exc}")
+            return
+
+        if not TK_AVAILABLE:
+            if LOG_FILE.exists():
+                subprocess.run(['open', str(LOG_FILE)])
+            else:
+                _show_info_dialog("Файл логов еще не создан.")
+            return
+
+        if self.log_window and self.log_window.winfo_exists():
+            self.log_window.lift()
+            self.log_window.focus_force()
+            return
+
+        if self.root and self.root.winfo_exists():
+            self.log_window = tk.Toplevel(self.root)
         else:
-            _show_info_dialog("Файл логов ещё не создан.")
+            self.log_window = tk.Tk()
+        self.log_window.title("TG WS Proxy - Логи")
+        self.log_window.geometry("900x560")
+
+        main = ttk.Frame(self.log_window, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        toolbar = ttk.Frame(main)
+        toolbar.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(toolbar, text="Показать строк:").pack(side=tk.LEFT)
+        tail_var = tk.StringVar(value=str(self.log_tail_lines))
+        tail_combo = ttk.Combobox(
+            toolbar,
+            textvariable=tail_var,
+            width=8,
+            state="readonly",
+            values=("100", "250", "500", "1000", "2000"),
+        )
+        tail_combo.pack(side=tk.LEFT, padx=(6, 10))
+
+        def apply_tail(*_args):
+            try:
+                self.log_tail_lines = int(tail_var.get())
+            except ValueError:
+                self.log_tail_lines = 250
+            self._refresh_log_view()
+
+        tail_combo.bind("<<ComboboxSelected>>", apply_tail)
+
+        ttk.Button(
+            toolbar, text="Открыть файл", command=lambda: subprocess.run(['open', str(LOG_FILE)])
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(toolbar, text="Обновить", command=self._refresh_log_view).pack(side=tk.LEFT)
+
+        self.log_text = scrolledtext.ScrolledText(main, wrap=tk.WORD, font=("Menlo", 11))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.configure(state=tk.DISABLED)
+
+        self._refresh_log_view()
+        self.log_window.lift()
+        self.log_window.focus_force()
     
     def on_closing(self):
         """Обработка закрытия окна"""

@@ -11,6 +11,7 @@ import struct
 import sys
 import signal
 import time
+import random
 from typing import Dict, List, Optional, Set, Tuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -23,6 +24,9 @@ _RECV_BUF = 65536
 _SEND_BUF = 65536
 _WS_POOL_SIZE = 4
 _WS_POOL_MAX_AGE = 120.0
+
+# DC, где WebSocket недоступен (используем только TCP fallback)
+_WS_DISABLED_DCS = {1, 3, 5}
 
 _TG_RANGES = [
     # 185.76.151.0/24
@@ -59,6 +63,8 @@ _IP_TO_DC: Dict[str, Tuple[int, bool]] = {
     '149.154.164.250': (4, True), '149.154.166.120': (4, True),
     '149.154.166.121': (4, True), '149.154.167.118': (4, True),
     '149.154.165.111': (4, True),
+    # DC4 media - дополнительный IP
+    '91.105.192.100': (4, True),
     # DC5
     '91.108.56.100': (5, False), '91.108.56.101': (5, False),
     '91.108.56.116': (5, False), '91.108.56.126': (5, False),
@@ -67,7 +73,7 @@ _IP_TO_DC: Dict[str, Tuple[int, bool]] = {
     '91.108.56.151': (5, True),
 }
 
-_dc_opt: Dict[int, Optional[str]] = {}
+_dc_opt: Dict[int, List[str]] = {}
 
 # DCs where WS is known to fail (302 redirect)
 # Raw TCP fallback will be used instead
@@ -77,11 +83,23 @@ _ws_blacklist: Set[Tuple[int, bool]] = set()
 # Rate-limit re-attempts per (dc, is_media)
 _dc_fail_until: Dict[Tuple[int, bool], float] = {}
 _DC_FAIL_COOLDOWN = 60.0  # seconds
+_DC_FAIL_MAX_COOLDOWN = 180.0
+
+_dc_state: Dict[Tuple[int, bool], Dict[str, float]] = {}
+_dc_ip_health: Dict[Tuple[int, str], Dict[str, float]] = {}
+
+_HEALTHCHECK_INTERVAL = 45.0
+_HEALTHCHECK_TIMEOUT = 4.0
 
 
 _ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+if os.getenv('TGWS_INSECURE_SSL', '').strip().lower() in {'1', 'true', 'yes'}:
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+    log.warning("TLS certificate verification is DISABLED (TGWS_INSECURE_SSL)")
+else:
+    _ssl_ctx.check_hostname = True
+    _ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
 
 def _set_sock_opts(transport):
@@ -96,6 +114,16 @@ def _set_sock_opts(transport):
     try:
         sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_RCVBUF, _RECV_BUF)
         sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, _SEND_BUF)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+        if hasattr(_socket, 'TCP_KEEPIDLE'):
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30)
+        if hasattr(_socket, 'TCP_KEEPINTVL'):
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10)
+        if hasattr(_socket, 'TCP_KEEPCNT'):
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3)
     except OSError:
         pass
 
@@ -146,16 +174,20 @@ class RawWebSocket:
 
     @staticmethod
     async def connect(ip: str, domain: str, path: str = '/apiws',
-                      timeout: float = 10.0) -> 'RawWebSocket':
+                      use_ssl: bool = True, timeout: float = 10.0) -> 'RawWebSocket':
         """
         Connect via TLS to the given IP,
         perform WebSocket upgrade, return a RawWebSocket.
 
         Raises WsHandshakeError on non-101 response.
         """
+        port = 443 if use_ssl else 80
+        ssl_ctx = _ssl_ctx if use_ssl else None
+        server_hostname = domain if use_ssl else None
+        
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, 443, ssl=_ssl_ctx,
-                                    server_hostname=domain),
+            asyncio.open_connection(ip, port, ssl=ssl_ctx,
+                                    server_hostname=server_hostname),
             timeout=min(timeout, 10))
         _set_sock_opts(writer.transport)
 
@@ -286,11 +318,13 @@ class RawWebSocket:
             await self.writer.drain()
         except Exception:
             pass
-        try:
-            self.writer.close()
-            await self.writer.wait_closed()
-        except Exception:
-            pass
+
+    async def ping(self, payload: bytes = b''):
+        """Send ping frame to keep WS connection alive."""
+        if self._closed:
+            raise ConnectionError("WebSocket closed")
+        self.writer.write(self._build_frame(self.OP_PING, payload, mask=True))
+        await self.writer.drain()
 
     @staticmethod
     def _build_frame(opcode: int, data: bytes,
@@ -463,9 +497,22 @@ class _MsgSplitter:
 
 
 def _ws_domains(dc: int, is_media) -> List[str]:
+    """Возвращает список доменов для WebSocket-соединения согласно документации.
+    
+    Для DC2: venus.web.telegram.org / venus-1.web.telegram.org
+    Для DC4: vesta.web.telegram.org / vesta-1.web.telegram.org
+    """
+    dc_names = {
+        2: 'venus',
+        4: 'vesta',
+    }
+    
+    name = dc_names.get(dc, f'kws{dc}')
+    
+    # Медиа-трафик часто требует -1 суффикс
     if is_media is None or is_media:
-        return [f'kws{dc}-1.web.telegram.org', f'kws{dc}.web.telegram.org']
-    return [f'kws{dc}.web.telegram.org', f'kws{dc}-1.web.telegram.org']
+        return [f'{name}-1.web.telegram.org', f'{name}.web.telegram.org']
+    return [f'{name}.web.telegram.org', f'{name}-1.web.telegram.org']
 
 
 class Stats:
@@ -480,14 +527,22 @@ class Stats:
         self.bytes_down = 0
         self.pool_hits = 0
         self.pool_misses = 0
+        self.ws_failures_by_dc: Dict[str, int] = {}
+        self.healthcheck_ok = 0
+        self.healthcheck_fail = 0
 
     def summary(self) -> str:
+        dc_fail = ','.join(
+            f'{k}:{v}' for k, v in sorted(self.ws_failures_by_dc.items())
+        ) or 'none'
         return (f"total={self.connections_total} ws={self.connections_ws} "
                 f"tcp_fb={self.connections_tcp_fallback} "
                 f"http_skip={self.connections_http_rejected} "
                 f"pass={self.connections_passthrough} "
                 f"err={self.ws_errors} "
                 f"pool={self.pool_hits}/{self.pool_hits+self.pool_misses} "
+                f"dc_fail={dc_fail} "
+                f"hc={self.healthcheck_ok}/{self.healthcheck_ok+self.healthcheck_fail} "
                 f"up={_human_bytes(self.bytes_up)} "
                 f"down={_human_bytes(self.bytes_down)}")
 
@@ -497,13 +552,13 @@ _stats = Stats()
 
 class _WsPool:
     def __init__(self):
-        self._idle: Dict[Tuple[int, bool], list] = {}
-        self._refilling: Set[Tuple[int, bool]] = set()
+        self._idle: Dict[Tuple[int, bool, str], list] = {}
+        self._refilling: Set[Tuple[int, bool, str]] = set()
 
     async def get(self, dc: int, is_media: bool,
                   target_ip: str, domains: List[str]
                   ) -> Optional[RawWebSocket]:
-        key = (dc, is_media)
+        key = (dc, is_media, target_ip)
         now = time.monotonic()
 
         bucket = self._idle.get(key, [])
@@ -530,7 +585,7 @@ class _WsPool:
         asyncio.create_task(self._refill(key, target_ip, domains))
 
     async def _refill(self, key, target_ip, domains):
-        dc, is_media = key
+        dc, is_media, _target_ip = key
         try:
             bucket = self._idle.setdefault(key, [])
             needed = _WS_POOL_SIZE - len(bucket)
@@ -574,19 +629,197 @@ class _WsPool:
         except Exception:
             pass
 
-    async def warmup(self, dc_opt: Dict[int, Optional[str]]):
+    async def warmup(self, dc_opt: Dict[int, List[str]]):
         """Pre-fill pool for all configured DCs on startup."""
-        for dc, target_ip in dc_opt.items():
-            if target_ip is None:
+        for dc, targets in dc_opt.items():
+            if not targets:
                 continue
             for is_media in (False, True):
                 domains = _ws_domains(dc, is_media)
-                key = (dc, is_media)
+                target_ip = targets[0]
+                key = (dc, is_media, target_ip)
                 self._schedule_refill(key, target_ip, domains)
         log.info("WS pool warmup started for %d DC(s)", len(dc_opt))
 
 
 _ws_pool = _WsPool()
+
+
+def _normalize_dc_opt(dc_opt: Dict[int, object]) -> Dict[int, List[str]]:
+    normalized: Dict[int, List[str]] = {}
+    for dc, value in dc_opt.items():
+        ips = value if isinstance(value, list) else [value]
+        clean: List[str] = []
+        for ip in ips:
+            if not isinstance(ip, str):
+                continue
+            try:
+                _socket.inet_aton(ip)
+            except OSError:
+                continue
+            if ip not in clean:
+                clean.append(ip)
+        if clean:
+            normalized[int(dc)] = clean
+    return normalized
+
+
+def _state_key(dc: int, is_media: bool) -> Tuple[int, bool]:
+    return (dc, bool(is_media))
+
+
+def _next_backoff(failures: int) -> float:
+    base = min(_DC_FAIL_MAX_COOLDOWN, max(1.0, 2 ** max(0, failures - 1)))
+    return base * random.uniform(0.8, 1.3)
+
+
+def _record_ws_failure(dc: int, is_media: bool):
+    key = _state_key(dc, is_media)
+    state = _dc_state.setdefault(
+        key, {'idx': 0.0, 'failures': 0.0, 'next_try': 0.0}
+    )
+    state['failures'] += 1.0
+    wait = _next_backoff(int(state['failures']))
+    state['next_try'] = time.monotonic() + wait
+    _dc_fail_until[key] = state['next_try']
+    dc_tag = f"DC{dc}{'m' if is_media else ''}"
+    _stats.ws_failures_by_dc[dc_tag] = _stats.ws_failures_by_dc.get(dc_tag, 0) + 1
+
+
+def _record_ws_success(dc: int, is_media: bool):
+    key = _state_key(dc, is_media)
+    state = _dc_state.setdefault(
+        key, {'idx': 0.0, 'failures': 0.0, 'next_try': 0.0}
+    )
+    state['failures'] = 0.0
+    state['next_try'] = 0.0
+    _dc_fail_until.pop(key, None)
+
+
+def _get_target_ips(dc: int) -> List[str]:
+    return _dc_opt.get(dc, [])
+
+
+def _get_rotated_targets(dc: int, is_media: bool) -> List[str]:
+    targets = _get_target_ips(dc)
+    if not targets:
+        return []
+    ranked = sorted(targets, key=lambda ip: _health_score(dc, ip), reverse=True)
+    state = _dc_state.setdefault(
+        _state_key(dc, is_media), {'idx': 0.0, 'failures': 0.0, 'next_try': 0.0}
+    )
+    idx = int(state['idx']) % len(ranked)
+    return ranked[idx:] + ranked[:idx]
+
+
+def _rotate_target(dc: int, is_media: bool):
+    targets = _get_target_ips(dc)
+    if len(targets) <= 1:
+        return
+    key = _state_key(dc, is_media)
+    state = _dc_state.setdefault(
+        key, {'idx': 0.0, 'failures': 0.0, 'next_try': 0.0}
+    )
+    state['idx'] = float((int(state['idx']) + 1) % len(targets))
+
+
+def _ip_health(dc: int, ip: str) -> Dict[str, float]:
+    return _dc_ip_health.setdefault(
+        (dc, ip),
+        {'ok': 0.0, 'fail': 0.0, 'lat': 9999.0, 'last_ok': 0.0, 'last_probe': 0.0},
+    )
+
+
+def _health_score(dc: int, ip: str) -> float:
+    st = _ip_health(dc, ip)
+    ok = st['ok']
+    fail = st['fail']
+    ratio = ok / (ok + fail + 1.0)
+    lat_penalty = min(st['lat'], 10.0) / 10.0
+    staleness = max(0.0, time.monotonic() - st['last_probe'])
+    stale_penalty = min(staleness / 300.0, 1.0)
+    return ratio - (0.35 * lat_penalty) - (0.15 * stale_penalty)
+
+
+def _record_ip_probe(dc: int, ip: str, success: bool, latency: float = 0.0):
+    st = _ip_health(dc, ip)
+    st['last_probe'] = time.monotonic()
+    if success:
+        st['ok'] += 1.0
+        if st['lat'] >= 9999.0:
+            st['lat'] = latency
+        else:
+            st['lat'] = (st['lat'] * 0.7) + (latency * 0.3)
+        st['last_ok'] = st['last_probe']
+        _stats.healthcheck_ok += 1
+    else:
+        st['fail'] += 1.0
+        _stats.healthcheck_fail += 1
+
+
+def _best_ip_snapshot() -> str:
+    parts: List[str] = []
+    for dc in sorted(_dc_opt.keys()):
+        ips = _dc_opt.get(dc, [])
+        if not ips:
+            continue
+        ranked = sorted(ips, key=lambda ip: _health_score(dc, ip), reverse=True)
+        best = ranked[0]
+        st = _ip_health(dc, best)
+        ok = int(st['ok'])
+        fail = int(st['fail'])
+        total = ok + fail
+        ratio = (ok / total) if total else 0.0
+        lat_ms = (st['lat'] * 1000.0) if st['lat'] < 9999.0 else -1.0
+        if lat_ms >= 0:
+            parts.append(
+                f"DC{dc}:{best} score={_health_score(dc, best):.3f} "
+                f"ok={ok}/{total} lat={lat_ms:.0f}ms"
+            )
+        else:
+            parts.append(
+                f"DC{dc}:{best} score={_health_score(dc, best):.3f} "
+                f"ok={ok}/{total} ratio={ratio:.2f}"
+            )
+    return '; '.join(parts) if parts else 'none'
+
+
+async def _probe_target(dc: int, ip: str) -> bool:
+    t0 = time.monotonic()
+    for domain in _ws_domains(dc, False):
+        ws = None
+        try:
+            ws = await RawWebSocket.connect(ip, domain, timeout=_HEALTHCHECK_TIMEOUT)
+            latency = max(0.001, time.monotonic() - t0)
+            _record_ip_probe(dc, ip, success=True, latency=latency)
+            return True
+        except WsHandshakeError as exc:
+            if exc.is_redirect:
+                continue
+        except Exception:
+            continue
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+    _record_ip_probe(dc, ip, success=False)
+    return False
+
+
+async def _healthcheck_loop():
+    while True:
+        await asyncio.sleep(_HEALTHCHECK_INTERVAL)
+        probes = []
+        for dc, ips in _dc_opt.items():
+            for ip in ips:
+                probes.append(asyncio.create_task(_probe_target(dc, ip)))
+        if not probes:
+            continue
+        results = await asyncio.gather(*probes, return_exceptions=True)
+        ok_count = sum(1 for r in results if r is True)
+        log.debug("healthcheck: %d/%d targets reachable", ok_count, len(probes))
 
 
 async def _bridge_ws(reader, writer, ws: RawWebSocket, label,
@@ -601,6 +834,14 @@ async def _bridge_ws(reader, writer, ws: RawWebSocket, label,
     up_packets = 0
     down_packets = 0
     start_time = asyncio.get_event_loop().time()
+
+    async def heartbeat():
+        try:
+            while True:
+                await asyncio.sleep(25)
+                await ws.ping()
+        except (asyncio.CancelledError, ConnectionError, OSError):
+            return
 
     async def tcp_to_ws():
         nonlocal up_bytes, up_packets
@@ -646,7 +887,8 @@ async def _bridge_ws(reader, writer, ws: RawWebSocket, label,
             log.debug("[%s] ws->tcp ended: %s", label, e)
 
     tasks = [asyncio.create_task(tcp_to_ws()),
-             asyncio.create_task(ws_to_tcp())]
+             asyncio.create_task(ws_to_tcp()),
+             asyncio.create_task(heartbeat())]
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -822,6 +1064,14 @@ async def _handle_client(reader, writer):
             return
 
         # -- Non-Telegram IP -> direct passthrough --
+        # Игнорируем подключения к 0.0.0.0 (ошибки Telegram Desktop)
+        if dst == '0.0.0.0':
+            log.debug("[%s] ignoring connection to 0.0.0.0", label)
+            writer.write(_socks5_reply(0x05))
+            await writer.drain()
+            writer.close()
+            return
+
         if not _is_telegram_ip(dst):
             _stats.connections_passthrough += 1
             log.debug("[%s] passthrough -> %s:%d", label, dst, port)
@@ -887,10 +1137,19 @@ async def _handle_client(reader, writer):
             await _tcp_fallback(reader, writer, dst, port, init, label)
             return
 
-        dc_key = (dc, is_media if is_media is not None else True)
+        media_key = (is_media if is_media is not None else True)
+        dc_key = _state_key(dc, media_key)
         now = time.monotonic()
         media_tag = (" media" if is_media
                      else (" media?" if is_media is None else ""))
+
+        # -- Для DC1,3,5 сразу используем TCP fallback (WebSocket не работает) --
+        if dc in _WS_DISABLED_DCS:
+            log.debug("[%s] DC%d%s WebSocket disabled, using TCP fallback", label, dc, media_tag)
+            ok = await _tcp_fallback(reader, writer, dst, port, init, label, dc=dc, is_media=is_media)
+            if ok:
+                log.info("[%s] DC%d%s TCP fallback closed", label, dc, media_tag)
+            return
 
         # -- WS blacklist check --
         if dc_key in _ws_blacklist:
@@ -918,16 +1177,20 @@ async def _handle_client(reader, writer):
 
         # -- Try WebSocket via direct connection --
         domains = _ws_domains(dc, is_media)
-        target = _dc_opt[dc]
         ws = None
         ws_failed_redirect = False
         all_redirects = True
 
-        ws = await _ws_pool.get(dc, is_media, target, domains)
-        if ws:
-            log.info("[%s] DC%d%s (%s:%d) -> pool hit via %s",
-                     label, dc, media_tag, dst, port, target)
-        else:
+        targets = _get_rotated_targets(dc, media_key)
+        active_target = None
+        for target in targets:
+            active_target = target
+            ws = await _ws_pool.get(dc, is_media, target, domains)
+            if ws:
+                log.info("[%s] DC%d%s (%s:%d) -> pool hit via %s",
+                         label, dc, media_tag, dst, port, target)
+                break
+
             for domain in domains:
                 url = f'wss://{domain}/apiws'
                 log.info("[%s] DC%d%s (%s:%d) -> %s via %s",
@@ -946,10 +1209,9 @@ async def _handle_client(reader, writer):
                                     exc.status_code, domain,
                                     exc.location or '?')
                         continue
-                    else:
-                        all_redirects = False
-                        log.warning("[%s] DC%d%s WS handshake: %s",
-                                    label, dc, media_tag, exc.status_line)
+                    all_redirects = False
+                    log.warning("[%s] DC%d%s WS handshake: %s",
+                                label, dc, media_tag, exc.status_line)
                 except Exception as exc:
                     _stats.ws_errors += 1
                     all_redirects = False
@@ -961,6 +1223,9 @@ async def _handle_client(reader, writer):
                     else:
                         log.warning("[%s] DC%d%s WS connect failed: %s",
                                     label, dc, media_tag, exc)
+            if ws is not None:
+                break
+            _rotate_target(dc, media_key)
 
         # -- WS failed -> fallback --
         if ws is None:
@@ -969,12 +1234,11 @@ async def _handle_client(reader, writer):
                 log.warning(
                     "[%s] DC%d%s blacklisted for WS (all 302)",
                     label, dc, media_tag)
-            elif ws_failed_redirect:
-                _dc_fail_until[dc_key] = now + _DC_FAIL_COOLDOWN
             else:
-                _dc_fail_until[dc_key] = now + _DC_FAIL_COOLDOWN
+                _record_ws_failure(dc, media_key)
                 log.info("[%s] DC%d%s WS cooldown for %ds",
-                         label, dc, media_tag, int(_DC_FAIL_COOLDOWN))
+                         label, dc, media_tag,
+                         int(max(1.0, _dc_fail_until.get(dc_key, now) - now)))
 
             log.info("[%s] DC%d%s -> TCP fallback to %s:%d",
                      label, dc, media_tag, dst, port)
@@ -986,8 +1250,11 @@ async def _handle_client(reader, writer):
             return
 
         # -- WS success --
-        _dc_fail_until.pop(dc_key, None)
+        _record_ws_success(dc, media_key)
         _stats.connections_ws += 1
+        if active_target:
+            log.debug("[%s] DC%d%s active target: %s",
+                      label, dc, media_tag, active_target)
 
         splitter = None
         if init_patched:
@@ -1025,11 +1292,11 @@ _server_instance = None
 _server_stop_event = None
 
 
-async def _run(port: int, dc_opt: Dict[int, Optional[str]],
+async def _run(port: int, dc_opt: Dict[int, object],
                stop_event: Optional[asyncio.Event] = None,
                host: str = '127.0.0.1'):
     global _dc_opt, _server_instance, _server_stop_event
-    _dc_opt = dc_opt
+    _dc_opt = _normalize_dc_opt(dc_opt)
     _server_stop_event = stop_event
 
     server = await asyncio.start_server(
@@ -1046,9 +1313,9 @@ async def _run(port: int, dc_opt: Dict[int, Optional[str]],
     log.info("  Telegram WS Bridge Proxy")
     log.info("  Listening on   %s:%d", host, port)
     log.info("  Target DC IPs:")
-    for dc in dc_opt.keys():
-        ip = dc_opt.get(dc)
-        log.info("    DC%d: %s", dc, ip)
+    for dc in _dc_opt.keys():
+        ips = _dc_opt.get(dc, [])
+        log.info("    DC%d: %s", dc, ', '.join(ips))
     log.info("=" * 60)
     log.info("  Configure Telegram Desktop:")
     log.info("    SOCKS5 proxy -> %s:%d  (no user/pass)", host, port)
@@ -1061,10 +1328,12 @@ async def _run(port: int, dc_opt: Dict[int, Optional[str]],
                 f'DC{d}{"m" if m else ""}'
                 for d, m in sorted(_ws_blacklist)) or 'none'
             log.info("stats: %s | ws_bl: %s", _stats.summary(), bl)
+            log.info("best_ip: %s", _best_ip_snapshot())
 
     asyncio.create_task(log_stats())
+    asyncio.create_task(_healthcheck_loop())
 
-    await _ws_pool.warmup(dc_opt)
+    await _ws_pool.warmup(_dc_opt)
 
     if stop_event:
         async def wait_stop():
@@ -1088,9 +1357,9 @@ async def _run(port: int, dc_opt: Dict[int, Optional[str]],
     _server_instance = None
 
 
-def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:
-    """Parse list of 'DC:IP' strings into {dc: ip} dict."""
-    dc_opt: Dict[int, str] = {}
+def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, List[str]]:
+    """Parse list of 'DC:IP' strings into {dc: [ip1, ip2, ...]} dict."""
+    dc_opt: Dict[int, List[str]] = {}
     for entry in dc_ip_list:
         if ':' not in entry:
             raise ValueError(f"Invalid --dc-ip format {entry!r}, expected DC:IP")
@@ -1100,11 +1369,13 @@ def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:
             _socket.inet_aton(ip_s)
         except (ValueError, OSError):
             raise ValueError(f"Invalid --dc-ip {entry!r}")
-        dc_opt[dc_n] = ip_s
+        dc_opt.setdefault(dc_n, [])
+        if ip_s not in dc_opt[dc_n]:
+            dc_opt[dc_n].append(ip_s)
     return dc_opt
 
 
-def run_proxy(port: int, dc_opt: Dict[int, str],
+def run_proxy(port: int, dc_opt: Dict[int, List[str]],
               stop_event: Optional[asyncio.Event] = None,
               host: str = '127.0.0.1'):
     """Run the proxy (blocking). Can be called from threads."""
