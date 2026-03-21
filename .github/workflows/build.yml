@@ -27,11 +27,16 @@ jobs:
         cd installer
         chmod +x build_app.sh
         ./build_app.sh
+        # Проверяем, что .app создался
+        ls -la dist/
     
     - name: Create DMG
       run: |
         brew install create-dmg
+        # Переходим в папку installer, где лежит .app
         cd installer
+        ls -la dist/
+        # Создаем DMG
         create-dmg \
           --volname "TG WS Proxy" \
           --volicon "icon.icns" \
